@@ -378,8 +378,27 @@ def _create_kwargs() -> dict:
     return kwargs
 
 
-def ask(query: str) -> str:
-    """跑一轮完整 Agent 循环，返回最终文本回答。"""
+def ask(query: str, trace: dict | None = None) -> str:
+    """跑一轮完整 Agent 循环，返回最终文本回答。
+
+    若传入 trace（dict），会就地填充结构化轨迹，便于 benchmark 等场景 dump：
+        trace["rounds"]   = [{round, thinking, content, usage, tool_calls:[{name,args,result}]}]
+        trace["messages"] = 完整 messages 列表（含 system/user/assistant/tool）
+        trace["answer"]   = 最终回答
+        trace["rounds_used"] = 实际使用轮数
+    """
+    rounds_trace: list[dict] = []
+    if trace is not None:
+        trace.setdefault("rounds", rounds_trace)
+        rounds_trace = trace["rounds"]
+
+    def _finish(answer: str, used: int) -> str:
+        if trace is not None:
+            trace["answer"] = answer
+            trace["messages"] = messages
+            trace["rounds_used"] = used
+        return answer
+
     client = OpenAI(api_key=LLM_API_KEY, base_url=f"{LLM_API_URL}/v1")
     create_kwargs = _create_kwargs()
     messages = [
@@ -405,10 +424,23 @@ def ask(query: str) -> str:
                            f"completion={getattr(usage, 'completion_tokens', '?')} "
                            f"total={getattr(usage, 'total_tokens', '?')}")
 
+        round_rec = {
+            "round": round_idx + 1,
+            "thinking": reasoning or "",
+            "content": msg.content or "",
+            "usage": {
+                "prompt": getattr(usage, "prompt_tokens", None),
+                "completion": getattr(usage, "completion_tokens", None),
+                "total": getattr(usage, "total_tokens", None),
+            } if usage else None,
+            "tool_calls": [],
+        }
+        rounds_trace.append(round_rec)
+
         # 没有工具调用 → 已是最终回答
         if not msg.tool_calls:
             _dbg(f"无工具调用，结束于第 {round_idx + 1} 轮")
-            return msg.content or ""
+            return _finish(msg.content or "", round_idx + 1)
 
         # 有工具调用 → 执行后回填结果，继续下一轮
         messages.append(msg.model_dump())
@@ -422,9 +454,10 @@ def ask(query: str) -> str:
             _dbg("tool_call →", f"{tc.function.name}({json.dumps(args, ensure_ascii=False)})")
             result = execute_tool(tc.function.name, args)
             _dbg(f"tool_result ← {tc.function.name}:", json.dumps(result, ensure_ascii=False))
+            round_rec["tool_calls"].append({"name": tc.function.name, "args": args, "result": result})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, ensure_ascii=False)})
 
-    return "（已达到最大工具调用轮次，未能给出最终回答）"
+    return _finish("（已达到最大工具调用轮次，未能给出最终回答）", MAX_ROUNDS)
 
 
 def main():
