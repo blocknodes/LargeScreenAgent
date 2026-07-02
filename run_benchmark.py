@@ -198,18 +198,22 @@ def render_trace(r: dict) -> str:
         f"ok={r['ok']}  rank={r['rank']}  "
         f"hit@1={int(r['hit1'])} hit@3={int(r['hit3'])} hit@5={int(r['hit5'])} hit@all={int(r['hit_all'])}  "
         f"rounds={trace.get('rounds_used', '?')}  tokens(total={r.get('total_tokens', 0)},"
-        f"peak_prompt={r.get('peak_prompt_tokens', 0)})  elapsed={r['elapsed']:.1f}s",
+        f"peak_prompt={r.get('peak_prompt_tokens', 0)})  "
+        f"elapsed={r['elapsed']:.1f}s (llm={r.get('llm_ms', 0)/1000:.1f}s tool={r.get('tool_ms', 0)/1000:.1f}s)",
     ]
     if r["error"]:
         lines.append(f"error : {r['error']}")
     for rd in trace.get("rounds", []):
-        lines.append(f"\n---- round {rd['round']} ----")
+        _lm = rd.get("llm_ms")
+        lines.append(f"\n---- round {rd['round']} ----" + (f"  (llm {_lm/1000:.1f}s)" if _lm else ""))
         if rd.get("thinking"):
             lines.append("[thinking]\n" + rd["thinking"])
         if rd.get("content"):
             lines.append("[assistant]\n" + rd["content"])
         for tc in rd.get("tool_calls", []):
-            lines.append(f"[tool_call] {tc['name']}({json.dumps(tc['args'], ensure_ascii=False)})")
+            _tm = tc.get("ms")
+            suffix = f"  ({_tm/1000:.1f}s)" if _tm else ""
+            lines.append(f"[tool_call] {tc['name']}({json.dumps(tc['args'], ensure_ascii=False)}){suffix}")
             lines.append("[tool_result] " + json.dumps(tc["result"], ensure_ascii=False))
     lines.append("\n---- final answer ----")
     lines.append(r["answer"] or "(空)")
@@ -218,6 +222,8 @@ def render_trace(r: dict) -> str:
 
 # dump 目录（在 main 中设置；为 None 表示不 dump 轨迹）
 DUMP_DIR: Path | None = None
+# 经验库文件路径（在 main 中设置；为 None 表示不注入经验）
+EXPERIENCE_FILE: str | None = None
 
 
 def _env_snapshot() -> dict:
@@ -263,6 +269,7 @@ def collect_config(args, csv_path: Path, total: int) -> dict:
             "weather_key": slime._mask(slime.WEATHER_API_KEY),
         },
         "prompt_file": slime.PROMPT_FILE,
+        "experience_file": EXPERIENCE_FILE or "",
         "max_rounds": slime.MAX_ROUNDS,
         "env": _env_snapshot(),
     }
@@ -277,6 +284,7 @@ def _agg_tokens(trace: dict) -> dict:
     prompt 每轮随上下文增长，故另记 peak（单轮最大 prompt）。
     """
     prompt = completion = total = peak_prompt = 0
+    llm_ms = tool_ms = 0
     for rd in trace.get("rounds", []):
         u = rd.get("usage") or {}
         p, c, t = (u.get("prompt") or 0), (u.get("completion") or 0), (u.get("total") or 0)
@@ -284,11 +292,16 @@ def _agg_tokens(trace: dict) -> dict:
         completion += c
         total += t
         peak_prompt = max(peak_prompt, p)
+        llm_ms += rd.get("llm_ms") or 0
+        for tc in rd.get("tool_calls", []):
+            tool_ms += tc.get("ms") or 0
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
         "peak_prompt_tokens": peak_prompt,
+        "llm_ms": llm_ms,
+        "tool_ms": tool_ms,
         "rounds": trace.get("rounds_used", len(trace.get("rounds", []))),
     }
 
@@ -299,7 +312,7 @@ def run_one(case: dict) -> dict:
     answer, error = "", ""
     trace: dict = {}
     try:
-        answer = slime.ask(case["query"], trace=trace)
+        answer = slime.ask(case["query"], trace=trace, experience_file=EXPERIENCE_FILE)
     except Exception as e:  # noqa: BLE001 - 跑分时单条失败不应中断整体
         error = f"{type(e).__name__}: {e}"
     elapsed = time.time() - start
@@ -340,14 +353,19 @@ def main() -> None:
                              "config.json / result.csv / summary.json / traces/ 都写入此处")
     parser.add_argument("--no-dump", action="store_true",
                         help="不写 traces/ 轨迹（仍写 config.json / result.csv / summary.json）")
+    parser.add_argument("--experience", default=None,
+                        help="经验库文件路径（注入 system prompt；也可用 SLIME_EXPERIENCE_FILE 环境变量）")
     args = parser.parse_args()
 
-    global DUMP_DIR
+    global DUMP_DIR, EXPERIENCE_FILE
 
     # 关闭 slime 的逐轮调试日志与日志文件，避免并发下 stderr/日志互相干扰
     slime.DEBUG = False
     slime.VERBOSE = False
     slime.LOG_FILE = None
+
+    # 经验库：命令行参数优先，其次环境变量
+    EXPERIENCE_FILE = args.experience or os.getenv("SLIME_EXPERIENCE_FILE") or None
 
     csv_path = Path(args.csv)
     if not csv_path.exists():
@@ -384,7 +402,8 @@ def main() -> None:
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"输出目录：{out_dir}", file=sys.stderr)
-    print(f"加载 {total} 条用例，模型={slime.LLM_MODEL}，并发={args.concurrency}{shuffle_note}", file=sys.stderr)
+    exp_note = f"，经验={EXPERIENCE_FILE}" if EXPERIENCE_FILE else ""
+    print(f"加载 {total} 条用例，模型={slime.LLM_MODEL}，并发={args.concurrency}{shuffle_note}{exp_note}", file=sys.stderr)
 
     results: list[dict] = []
     done = 0
@@ -427,6 +446,8 @@ def main() -> None:
     max_peak_prompt = max((r["peak_prompt_tokens"] for r in ok_runs), default=0)
     max_total_tok = max((r["total_tokens"] for r in ok_runs), default=0)
     avg_elapsed = sum(r["elapsed"] for r in ok_runs) / n
+    avg_llm_s = sum(r.get("llm_ms", 0) for r in ok_runs) / n / 1000
+    avg_tool_s = sum(r.get("tool_ms", 0) for r in ok_runs) / n / 1000
 
     def pct(x: int) -> str:
         return f"{x}/{total} ({x / total:.2%})" if total else "0/0"
@@ -444,7 +465,8 @@ def main() -> None:
     print(f"  hit@5      : {pct(hit5)}", file=sys.stderr)
     print(f"  hit@all    : {pct(hit_all)}", file=sys.stderr)
     print(f"  异常       : {errors}", file=sys.stderr)
-    print(f"  总耗时     : {wall:.1f}s（并发 {args.concurrency}），单条均耗时 {avg_elapsed:.1f}s", file=sys.stderr)
+    print(f"  总耗时     : {wall:.1f}s（并发 {args.concurrency}），单条均耗时 {avg_elapsed:.1f}s"
+          f"（llm {avg_llm_s:.1f}s + tool {avg_tool_s:.1f}s）", file=sys.stderr)
     print(f"  平均轮次   : {avg_rounds:.1f}", file=sys.stderr)
     print(f"  token/条   : prompt={avg_prompt:,.0f} completion={avg_completion:,.0f} "
           f"total={avg_total_tok:,.0f}（peak_prompt 均 {avg_peak_prompt:,.0f}/最大 {max_peak_prompt:,}）",
@@ -463,13 +485,14 @@ def main() -> None:
         writer.writerow(["idx", "query", "label", "ok", "rank",
                          "hit1", "hit3", "hit5", "hit_all",
                          "rounds", "prompt_tokens", "completion_tokens", "total_tokens",
-                         "peak_prompt_tokens", "error", "elapsed_s", "answer"])
+                         "peak_prompt_tokens", "error", "elapsed_s", "llm_s", "tool_s", "answer"])
         for r in results:
             writer.writerow([
                 r["idx"], r["query"], r["label"], int(r["ok"]), r["rank"],
                 int(r["hit1"]), int(r["hit3"]), int(r["hit5"]), int(r["hit_all"]),
                 r["rounds"], r["prompt_tokens"], r["completion_tokens"], r["total_tokens"],
-                r["peak_prompt_tokens"], r["error"], f"{r['elapsed']:.1f}", r["answer"],
+                r["peak_prompt_tokens"], r["error"], f"{r['elapsed']:.1f}",
+                f"{r.get('llm_ms', 0) / 1000:.1f}", f"{r.get('tool_ms', 0) / 1000:.1f}", r["answer"],
             ])
 
     # 结构化轨迹 jsonl（含完整 messages / 每轮 tool 调用）
@@ -495,6 +518,8 @@ def main() -> None:
         "wall_seconds": round(wall, 1),
         "concurrency": args.concurrency,
         "avg_elapsed": round(avg_elapsed, 2),
+        "avg_llm_s": round(avg_llm_s, 2),
+        "avg_tool_s": round(avg_tool_s, 2),
         "avg_rounds": round(avg_rounds, 1),
         "avg_prompt_tokens": round(avg_prompt),
         "avg_completion_tokens": round(avg_completion),

@@ -20,6 +20,7 @@
 
 import argparse
 import json
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -52,8 +53,15 @@ def _db_has_hit(result: dict) -> bool:
 
 
 def iter_traces(run_dir: Path):
-    """逐行读取 traces.jsonl，yield 每条结果 dict。"""
-    p = run_dir / "traces" / "traces.jsonl"
+    """逐行读取 traces.jsonl，yield 每条结果 dict。
+
+    若目录下没有 traces/traces.jsonl（例如 --strong 指向了不存在或未 dump 轨迹
+    的目录），打印告警并返回空，而不是抛 FileNotFoundError 中断整个流程。
+    """
+    p = Path(run_dir) / "traces" / "traces.jsonl"
+    if not p.exists():
+        print(f"⚠ 未找到轨迹文件，忽略该目录：{p}", file=sys.stderr)
+        return
     with open(p, encoding="utf-8") as f:
         for line in f:
             line = line.strip()

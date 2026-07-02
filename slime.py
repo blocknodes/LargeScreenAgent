@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -45,11 +46,27 @@ LLM_TOP_P = float(v) if (v := os.getenv("LLM_TOP_P", "")) else None
 LLM_SEED = int(v) if (v := os.getenv("LLM_SEED", "")) else None
 LLM_PRESENCE_PENALTY = float(v) if (v := os.getenv("LLM_PRESENCE_PENALTY", "")) else None
 LLM_FREQUENCY_PENALTY = float(v) if (v := os.getenv("LLM_FREQUENCY_PENALTY", "")) else None
+
+
+def _parse_bool_opt(v: str | None):
+    """把字符串解析成 True/False/None（None=未设置，不干预）。"""
+    s = (v or "").strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+# thinking（推理链）开关：留空=不干预（用模型默认）；开/关则通过 extra_body 下发
+# chat_template_kwargs.enable_thinking（vLLM/Qwen 等自建服务约定）。
+LLM_ENABLE_THINKING = _parse_bool_opt(os.getenv("LLM_ENABLE_THINKING", ""))
 WEB_SEARCH_API_KEY = os.getenv("WEB_SEARCH_API_KEY", "")
 WEB_SEARCH_URL = os.getenv("WEB_SEARCH_URL", "")
 DB_SEARCH_URL = os.getenv("DB_SEARCH2_URL", "")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
 PROMPT_FILE = os.getenv("SLIME_PROMPT_FILE", str(Path(__file__).parent / "slime_prompt.txt"))
+EXPERIENCE_FILE = os.getenv("SLIME_EXPERIENCE_FILE", "")  # 经验库文件路径，为空则不注入经验
 
 MAX_ROUNDS = 10
 
@@ -133,34 +150,41 @@ def _fmt_message(m: dict) -> str:
 
 
 def _format_messages(messages: list[dict]) -> str:
-    return "\n\n".join(_fmt_message(m) for m in messages)
+    """完整序列化 messages 为 JSON——保留所有字段原样。"""
+    try:
+        return json.dumps(messages, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return repr(messages)
 
 
 def _format_response(resp) -> str:
-    """把 LLM 原始响应渲染成可读文本。"""
-    choice = resp.choices[0]
-    msg = choice.message
-    parts = [f"finish_reason: {choice.finish_reason}"]
-    reasoning = _extract_reasoning(msg)
-    if reasoning:
-        parts.append(f"──── reasoning ────\n{reasoning}")
-    if msg.content:
-        parts.append(f"──── content ────\n{msg.content}")
-    for tc in (msg.tool_calls or []):
-        parts.append(f"──── tool_call ────\n{_fmt_tool_call(tc.function.name, tc.function.arguments)}")
-    u = getattr(resp, "usage", None)
-    if u:
-        parts.append(f"──── usage ────\nprompt={getattr(u, 'prompt_tokens', '?')} "
-                     f"completion={getattr(u, 'completion_tokens', '?')} total={getattr(u, 'total_tokens', '?')}")
-    return "\n".join(parts)
+    """把 LLM 原始响应完整序列化为 JSON——不丢任何字段（reasoning/content/tool_calls/usage 等）。"""
+    try:
+        # openai SDK 的 response 对象有 model_dump()，返回完整 dict
+        d = resp.model_dump() if hasattr(resp, "model_dump") else resp
+        return json.dumps(d, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return repr(resp)
 
 
 def _extract_reasoning(message) -> str | None:
-    """提取思考链内容（不同厂商字段名不同，尽量兼容）。"""
-    r = getattr(message, "reasoning_content", None) or getattr(message, "thinking_content", None)
-    if not r and getattr(message, "model_extra", None):
-        r = message.model_extra.get("reasoning_content") or message.model_extra.get("thinking_content")
-    return r
+    """提取思考链内容（不同厂商/不同 vLLM 版本字段名不同，尽量兼容）。
+
+    已知字段名：
+      - reasoning_content（多数 vLLM 版本 / DeepSeek）
+      - reasoning（vLLM 0.21 等 build）
+      - thinking_content（部分厂商）
+    """
+    for attr in ("reasoning_content", "reasoning", "thinking_content"):
+        r = getattr(message, attr, None)
+        if r:
+            return r
+    extra = getattr(message, "model_extra", None)
+    if extra:
+        for key in ("reasoning_content", "reasoning", "thinking_content"):
+            if extra.get(key):
+                return extra[key]
+    return None
 
 
 # ============================================================
@@ -339,11 +363,13 @@ def _print_config() -> None:
         f"  采样参数         : temperature={LLM_TEMPERATURE if LLM_TEMPERATURE is not None else '默认'}"
         f" top_p={LLM_TOP_P if LLM_TOP_P is not None else '默认'}"
         f" seed={LLM_SEED if LLM_SEED is not None else '默认'}",
+        f"  thinking         : {'开' if LLM_ENABLE_THINKING is True else '关' if LLM_ENABLE_THINKING is False else '默认(不干预)'}",
         f"  WEB_SEARCH_URL   : {WEB_SEARCH_URL or '(未设置)'}",
         f"  WEB_SEARCH_KEY   : {_mask(WEB_SEARCH_API_KEY)}",
         f"  DB_SEARCH_URL    : {DB_SEARCH_URL or '(未设置)'}",
         f"  WEATHER_API_KEY  : {_mask(WEATHER_API_KEY)}",
         f"  PROMPT_FILE      : {PROMPT_FILE}" + ("" if Path(PROMPT_FILE).exists() else "  ⚠ 文件不存在"),
+        f"  EXPERIENCE_FILE  : {EXPERIENCE_FILE or '(未设置)'}",
         f"  MAX_ROUNDS       : {MAX_ROUNDS}",
         f"  输出模式         : {mode}",
         f"  日志文件         : {LOG_PATH or '(未启用)'}",
@@ -357,14 +383,38 @@ def _print_config() -> None:
         LOG_FILE.flush()
 
 
-def system_prompt() -> str:
+def system_prompt(experience_file: str | None = None) -> str:
+    """构建 system prompt，可选注入经验规则。
+
+    Args:
+        experience_file: 经验库文件路径。如不传则使用 EXPERIENCE_FILE 环境变量配置。
+    """
     tpl = Path(PROMPT_FILE).read_text(encoding="utf-8")
-    return tpl.replace("{current_date}", datetime.now().strftime("%Y年%m月%d日"))
+    prompt = tpl.replace("{current_date}", datetime.now().strftime("%Y年%m月%d日"))
+
+    # 注入经验规则
+    exp_path = experience_file or EXPERIENCE_FILE
+    if exp_path:
+        try:
+            from experience_store import ExperienceStore
+            store = ExperienceStore(exp_path).load()
+            block = store.render_prompt_block(include_examples=False)
+            if block:
+                prompt = prompt + "\n\n" + block
+                _dbg("experience:", f"已注入 {len(store.get_enabled())} 条经验规则 (from {exp_path})")
+        except Exception as e:
+            _dbg("experience warning:", f"加载经验库失败: {e}")
+
+    return prompt
 
 
-def _create_kwargs() -> dict:
-    """构建 chat.completions.create 的参数；采样参数仅在显式配置时才传。"""
-    kwargs = dict(model=LLM_MODEL, tools=TOOLS, tool_choice="auto", max_tokens=LLM_MAX_TOKENS)
+def _create_kwargs(model: str | None = None, enable_thinking=None) -> dict:
+    """构建 chat.completions.create 的参数；采样参数仅在显式配置时才传。
+
+    enable_thinking: True/False 时通过 extra_body 下发 thinking 开关；
+                     None 时回退到全局 LLM_ENABLE_THINKING；仍为 None 则完全不干预。
+    """
+    kwargs = dict(model=model or LLM_MODEL, tools=TOOLS, tool_choice="auto", max_tokens=LLM_MAX_TOKENS)
     if LLM_TEMPERATURE is not None:
         kwargs["temperature"] = LLM_TEMPERATURE
     if LLM_TOP_P is not None:
@@ -375,10 +425,15 @@ def _create_kwargs() -> dict:
         kwargs["presence_penalty"] = LLM_PRESENCE_PENALTY
     if LLM_FREQUENCY_PENALTY is not None:
         kwargs["frequency_penalty"] = LLM_FREQUENCY_PENALTY
+    et = enable_thinking if enable_thinking is not None else LLM_ENABLE_THINKING
+    if et is not None:
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": bool(et)}}
     return kwargs
 
 
-def ask(query: str, trace: dict | None = None) -> str:
+def ask(query: str, trace: dict | None = None, experience_file: str | None = None,
+        on_event=None, model: str | None = None, api_url: str | None = None,
+        api_key: str | None = None, enable_thinking=None) -> str:
     """跑一轮完整 Agent 循环，返回最终文本回答。
 
     若传入 trace（dict），会就地填充结构化轨迹，便于 benchmark 等场景 dump：
@@ -386,32 +441,49 @@ def ask(query: str, trace: dict | None = None) -> str:
         trace["messages"] = 完整 messages 列表（含 system/user/assistant/tool）
         trace["answer"]   = 最终回答
         trace["rounds_used"] = 实际使用轮数
+
+    experience_file: 经验库文件路径（覆盖 EXPERIENCE_FILE 环境变量）
     """
     rounds_trace: list[dict] = []
     if trace is not None:
         trace.setdefault("rounds", rounds_trace)
         rounds_trace = trace["rounds"]
 
+    def _emit(ev: dict) -> None:
+        """把一个流式事件推给回调（若提供）。事件结构与 build_steps 一致。"""
+        if on_event:
+            try:
+                on_event(ev)
+            except Exception as e:  # 回调异常不应影响主循环
+                _dbg("on_event warning:", str(e))
+
     def _finish(answer: str, used: int) -> str:
         if trace is not None:
             trace["answer"] = answer
             trace["messages"] = messages
             trace["rounds_used"] = used
+        _emit({"type": "answer", "content": answer})
         return answer
 
-    client = OpenAI(api_key=LLM_API_KEY, base_url=f"{LLM_API_URL}/v1")
-    create_kwargs = _create_kwargs()
+    client = OpenAI(api_key=api_key or LLM_API_KEY, base_url=f"{api_url or LLM_API_URL}/v1")
+    create_kwargs = _create_kwargs(model=model, enable_thinking=enable_thinking)
+    _eb = create_kwargs.get("extra_body")
+    _dbg("请求模型:", f"{create_kwargs.get('model', '')} | extra_body: "
+         + (json.dumps(_eb, ensure_ascii=False) if _eb else "(无，即不干预 thinking)"))
     messages = [
-        {"role": "system", "content": system_prompt()},
+        {"role": "system", "content": system_prompt(experience_file=experience_file)},
         {"role": "user", "content": query},
     ]
 
     for round_idx in range(MAX_ROUNDS):
         _dbg(f"===== 第 {round_idx + 1} 轮 LLM 调用 =====")
         _vrb("LLM 输入 messages:", _format_messages(messages))
+        _t_llm = time.perf_counter()
         resp = client.chat.completions.create(messages=messages, **create_kwargs)
+        llm_ms = int((time.perf_counter() - _t_llm) * 1000)
         msg = resp.choices[0].message
         _vrb("LLM 原始输出:", _format_response(resp))
+        _dbg("LLM 耗时:", f"{llm_ms} ms")
 
         reasoning = _extract_reasoning(msg)
         if reasoning:
@@ -433,9 +505,17 @@ def ask(query: str, trace: dict | None = None) -> str:
                 "completion": getattr(usage, "completion_tokens", None),
                 "total": getattr(usage, "total_tokens", None),
             } if usage else None,
+            "llm_ms": llm_ms,
             "tool_calls": [],
         }
         rounds_trace.append(round_rec)
+
+        # 流式：先推本轮 LLM 耗时，再推思考（与 build_steps 顺序一致）
+        _emit({"type": "llm", "ms": llm_ms, "round": round_idx + 1})
+        if reasoning:
+            _emit({"type": "thinking", "content": reasoning})
+        if msg.content and msg.tool_calls:
+            _emit({"type": "thought", "content": msg.content})
 
         # 没有工具调用 → 已是最终回答
         if not msg.tool_calls:
@@ -452,9 +532,15 @@ def ask(query: str, trace: dict | None = None) -> str:
                 args = {}
                 _dbg("⚠ 工具参数 JSON 解析失败:", tc.function.arguments or "")
             _dbg("tool_call →", f"{tc.function.name}({json.dumps(args, ensure_ascii=False)})")
+            _emit({"type": "tool_call", "tool_name": tc.function.name, "tool_args": args})
+            _t_tool = time.perf_counter()
             result = execute_tool(tc.function.name, args)
+            tool_ms = int((time.perf_counter() - _t_tool) * 1000)
             _dbg(f"tool_result ← {tc.function.name}:", json.dumps(result, ensure_ascii=False))
-            round_rec["tool_calls"].append({"name": tc.function.name, "args": args, "result": result})
+            _dbg("工具耗时:", f"{tc.function.name} {tool_ms} ms")
+            _emit({"type": "tool_result", "tool_name": tc.function.name, "content": result, "ms": tool_ms})
+            round_rec["tool_calls"].append({"name": tc.function.name, "args": args,
+                                            "result": result, "ms": tool_ms})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, ensure_ascii=False)})
 
     return _finish("（已达到最大工具调用轮次，未能给出最终回答）", MAX_ROUNDS)
